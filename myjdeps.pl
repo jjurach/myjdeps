@@ -1,42 +1,111 @@
 #!/usr/bin/perl -w
 use strict;
-$| = 1;
 
 use File::Temp qw(tempdir);
 
-my (@files,@args,@jarmap);
-for my $arg (@ARGV) {
-  if (! -f $arg) {
-    push @args, $arg;
-  } elsif ($arg =~ /.jar$/) {
-    my $dir = tempdir("jdepsXXXX", CLEANUP=>1, DIR=>$ENV{TMPDIR} || '/tmp');
-    push @jarmap, sub { my ($s) = @_; $s =~ s/$dir\//$arg:/; return $s };
-    system("(cd $dir; jar xv > list.txt) < $arg") == 0 or exit;
-    open my $fh, '<', "$dir/list.txt" or die "open $dir/list.txt: $!\n";
-    for my $line (<$fh>) {
-      $line =~ /.* (\S+\.class)$/ and push @files, "$dir/$1";
-    }
-    close $fh;
-  } else {
-    push @files, $arg;
+use vars qw(%KEYWORDS);
+BEGIN {
+  %KEYWORDS = map { $_=>1 } qw(public private protected void implements extends static);
+}
+
+sub main {
+  my (@argv) = @_;
+
+  $| = 1;
+  my ($files,$args,$jarmap) = process_argv(@argv);
+
+  my ($cmds) = commands_from_files($files,$args);
+
+  my (@DATA, $cur);
+  for my $cmd (@$cmds) {
+    my $data = process_cmd($cmd);
+    push @DATA, @$data;
   }
+
+  display_data(\@DATA, $files, $jarmap);
+
+  return 0;
 }
 
-my @cmds;
-my @tfiles = @files;
-while (@tfiles > 2000) {
-  my @files0 = splice @tfiles, 0, 1000;
-  push @cmds, "javap -p -c @args @files0";
-}
-if (@tfiles > 1000) {
-  my @files0 = splice @tfiles, 0, @tfiles/2;
-  push @cmds, "javap -p -c @args @files0";
-}
-push @cmds, "javap -p -c @args @tfiles";
+sub process_argv {
+  my (@argv) = @_;
 
+  my (@files,@args,@jarmap);
+  for my $arg (@argv) {
+    if (! -f $arg) {
+      push @args, $arg;
+    } elsif ($arg =~ /.jar$/) {
+      my $dir = tempdir("myjdepsXXXX", CLEANUP=>1, DIR=>$ENV{TMPDIR} || '/tmp');
+      push @jarmap, sub { my ($s) = @_; $s =~ s/$dir\//$arg:/; return $s };
+      system("(cd $dir; jar xv > list.txt) < $arg") == 0 or exit;
+      open my $fh, '<', "$dir/list.txt" or die "open $dir/list.txt: $!\n";
+      for my $line (<$fh>) {
+        $line =~ /.* (\S+\.class)$/ and push @files, "$dir/$1";
+      }
+      close $fh;
+    } else {
+      push @files, $arg;
+    }
+  }
+  return (\@files,\@args,\@jarmap);
+}
 
-my (@DATA, $cur);
-for my $cmd (@cmds) {
+sub commands_from_files {
+  my ($files,$args) = @_;
+
+  my @cmds;
+  my @tfiles = @$files;
+  while (@tfiles > 2000) {
+    my @files0 = splice @tfiles, 0, 1000;
+    push @cmds, "javap -p -c @$args @files0";
+  }
+  if (@tfiles > 1000) {
+    my @files0 = splice @tfiles, 0, @tfiles/2;
+    push @cmds, "javap -p -c @$args @files0";
+  }
+  push @cmds, "javap -p -c @$args @tfiles";
+
+  return \@cmds;
+}
+
+sub display_data {
+  my ($DATA,$files,$jarmap) = @_;
+
+  if (@$files != @$DATA) {
+    warn @$files." files but ".@$DATA." parses??\n";
+  }
+
+  print "digraph jdep {\nrankdir=LR\n" if $ENV{DOT};
+
+  for my $data_n (0..$#$DATA) {
+    my $data = $DATA->[$data_n];
+    my $file = $files->[$data_n];
+    for (@$jarmap) {
+      $file = $_->($file);
+    }
+    my ($name,$seen,$error) = @{$data}{qw(name seen error)};
+
+    my ($prim,$jlang,$java,$sun,$other) =
+      partition([sort keys %$seen], qr!^\w+$!, qr!^java\.lang\.!, qr!^javax?\.!, qr!^sun\.!);
+
+    print "# $file\n" if @$files == @$DATA;
+    print("# Error: $error\n"), next if $error;
+
+    print "$name\n" if ! $ENV{DOT};
+    for my $list ($jlang,$java,$sun,$other) {
+      for my $c (@$list) {
+        print $ENV{DOT} ? "  \"$name\" -> \"$c\";\n" : "  $c\n";
+      }
+    }
+  }
+  print "}\n" if $ENV{DOT};
+}
+
+sub process_cmd {
+  my ($cmd) = @_;
+
+  my (@DATA, $cur);
+
   open my $fh, '-|', "$cmd 2>&1" or die "$cmd: $!\n";
 
   while (<$fh>) {
@@ -81,41 +150,9 @@ for my $cmd (@cmds) {
     }
   }
   close $fh;
+  return \@DATA;
 }
 
-  if (@files != @DATA) {
-    warn @files." files but ".@DATA." parses??\n";
-  }
-
-  print "digraph jdep {\nrankdir=LR\n" if $ENV{DOT};
-
-  for my $data_n (0..$#DATA) {
-    my $data = $DATA[$data_n];
-    my $file = $files[$data_n];
-    for (@jarmap) {
-      $file = $_->($file);
-    }
-    my ($name,$seen,$error) = @{$data}{qw(name seen error)};
-
-    my ($prim,$jlang,$java,$sun,$other) =
-      partition([sort keys %$seen], qr!^\w+$!, qr!^java\.lang\.!, qr!^javax?\.!, qr!^sun\.!);
-
-    print "# $file\n" if @files == @DATA;
-    print("# Error: $error\n"), next if $error;
-
-    print "$name\n" if ! $ENV{DOT};
-    for my $list ($jlang,$java,$sun,$other) {
-      for my $c (@$list) {
-        print $ENV{DOT} ? "  \"$name\" -> \"$c\";\n" : "  $c\n";
-      }
-    }
-  }
-  print "}\n" if $ENV{DOT};
-
-use vars qw(%KEYWORDS);
-BEGIN {
-  %KEYWORDS = map { $_=>1 } qw(public private protected void implements extends static);
-}
 sub scan_classes {
   my ($str) = @_;
   my %out;
@@ -142,3 +179,5 @@ sub partition {
   return @out_list;
 }
 
+################################################################################
+caller() or exit main(@ARGV);
